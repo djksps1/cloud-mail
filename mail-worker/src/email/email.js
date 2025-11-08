@@ -25,6 +25,7 @@ function extractFirstEmail(s) {
   const m = s.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[A-Za-z]{2,}/);
   return m ? m[0] : null;
 }
+
 function normalizeEmail(addr, dropPlus = true) {
   if (!addr) return null;
   let [local, domain] = addr.trim().toLowerCase().split('@');
@@ -32,30 +33,42 @@ function normalizeEmail(addr, dropPlus = true) {
   if (dropPlus && local.includes('+')) local = local.split('+')[0];
   return `${local}@${domain}`;
 }
+
 function parseAddr(addr) {
   const n = normalizeEmail(addr || '');
   if (!n) return { local: '', domain: '' };
   const i = n.lastIndexOf('@');
   return { local: n.slice(0, i), domain: n.slice(i + 1) };
 }
-function safeJSON(s, def) {
-  try { return s ? JSON.parse(s) : def; } catch { return def; }
+
+// 兼容 Cloudflare UI “JSON 类型变量”（可能已经是对象）
+function safeJSON(val, def) {
+  try {
+    if (!val) return def;
+    if (typeof val === 'string') return JSON.parse(val);
+    if (typeof val === 'object') return val;
+    return def;
+  } catch {
+    return def;
+  }
 }
-/** 还原 To：尽量用保留头，失败就用 fallback（envelope rcptTo） */
-function resolveRecipientFromHeaders(headers, fallbackTo) {
-  const keys = ['x-original-to','original-recipient','delivered-to','envelope-to','x-receiver','x-forwarded-to'];
-  for (const k of keys) {
+
+/** 还原 To：优先 To / X-Original-To / Original-Recipient；不使用 Delivered-To */
+function resolveRecipientFromHeaders(headers, fallback) {
+  const tryKeys = ['to', 'x-original-to', 'original-recipient', 'envelope-to', 'x-receiver', 'x-forwarded-to'];
+  for (const k of tryKeys) {
     const v = headers.get(k);
     if (v) {
       const em = extractFirstEmail(v);
       if (em) return normalizeEmail(em);
     }
   }
-  return normalizeEmail(fallbackTo);
+  return normalizeEmail(fallback);
 }
-/** 接收域 -> 展示域 */
+
+/** 接收域 -> 展示域（cPanel 域） */
 function mapToDisplayDomain(envelopeDomain, env) {
-  const map = safeJSON(env.DISPLAY_DOMAIN_MAP, {});
+  const map = safeJSON(env.DISPLAY_DOMAIN_MAP, {}); // { "788520.xyz": "ccc.sandbox.lib.uci.edu", ... }
   const d = (envelopeDomain || '').toLowerCase();
   const v = map[d];
   if (!v) return d;
@@ -72,7 +85,8 @@ export async function email(message, env, ctx) {
     const {
       receive,
       tgBotToken, tgChatId, tgBotStatus,
-      ruleEmail, ruleType, r2Domain
+      ruleEmail, ruleType, r2Domain,
+      noRecipient
     } = settings;
 
     if (receive === settingConst.receive.CLOSE) {
@@ -80,29 +94,40 @@ export async function email(message, env, ctx) {
       return;
     }
 
-    // 0) envelope & headers（Email Workers Runtime 提供）
-    const envelopeTo = normalizeEmail(message.to); // 信封收件人（用于域映射）
+    // 0) envelope & headers（Email Workers 运行时提供）
+    const envelopeTo = normalizeEmail(message.to); // rcptTo（收件域判断用）
     const headers = message.headers;
-    const { local: envLocal, domain: envDomain } = parseAddr(envelopeTo);
 
-    // 1) 仅处理允许的接收域（可选）
+    // 1) 白名单：只处理允许的接收域
     const allow = safeJSON(env.ALLOWED_ENVELOPE_DOMAINS, []);
-    if (Array.isArray(allow) && allow.length > 0 && !allow.map(s => s.toLowerCase()).includes(envDomain)) {
-      console.log('[MAIL] not allowed envelope domain:', envDomain);
-      return;
+    const { local: envLocal, domain: envDomain } = parseAddr(envelopeTo);
+    if (Array.isArray(allow) && allow.length > 0) {
+      const ok = allow.map(s => String(s).toLowerCase()).includes((envDomain || '').toLowerCase());
+      if (!ok) {
+        console.log('[MAIL] not allowed envelope domain:', envDomain);
+        return;
+      }
     }
 
-    // 2) 解析 To 的本地部分（若上游保留原 To 则优先）
-    const headerTo = headers.get('to');
-    const resolvedTo = resolveRecipientFromHeaders(headers, envelopeTo);
+    // 2) 解析 To（优先 To / X-Original-To 等），本地部分优先来自 headerTo
+    const headerToRaw = headers.get('to');
+    const resolvedTo = resolveRecipientFromHeaders(headers, headerToRaw || envelopeTo);
     const { local: hdrLocal } = parseAddr(resolvedTo);
     const localPart = hdrLocal || envLocal;
 
-    // 3) 接收域 -> 展示域（cPanel 域） & 目标展示地址
+    // 3) 接收域 -> 展示域（仅用于入库显示，不做实际转发）
     const displayDomain = mapToDisplayDomain(envDomain, env);
-    let targetDisplayAddr = normalizeEmail(`${localPart}@${displayDomain}`);
+    let finalTo = normalizeEmail(`${localPart}@${displayDomain}`);
 
-    // 4) 读取原始报文并解析
+    console.log('[MAIL] from(Envelope)=', message.from);
+    console.log('[MAIL] envelope.to   =', envelopeTo);
+    console.log('[MAIL] header.to     =', headerToRaw);
+    console.log('[MAIL] localPart     =', localPart);
+    console.log('[MAIL] displayDomain =', displayDomain);
+    console.log('[MAIL] finalTo       =', finalTo);
+
+    // 4) 读取原始报文并解析（PostalMime）
+    // message.raw 是 ReadableStream，可在 Email Workers 里读取再解析。:contentReference[oaicite:1]{index=1}
     const reader = message.raw.getReader();
     let raw = '';
     while (true) {
@@ -110,20 +135,13 @@ export async function email(message, env, ctx) {
       if (done) break;
       raw += new TextDecoder().decode(value);
     }
-    const parsed = await PostalMime.parse(raw);
+    const parsed = await PostalMime.parse(raw); // postal-mime 在 Workers/浏览器环境都可用。:contentReference[oaicite:2]{index=2}
 
-    console.log('[MAIL] from(Envelope)=', message.from);
-    console.log('[MAIL] envelope.to   =', envelopeTo);
-    console.log('[MAIL] header.to     =', headerTo);
-    console.log('[MAIL] localPart     =', localPart);
-    console.log('[MAIL] displayDomain =', displayDomain);
-    console.log('[MAIL] targetDisplay =', targetDisplayAddr);
+    // 5) 账号匹配（以展示域地址为准）
+    let account = await accountService.selectByEmailIncludeDel({ env }, finalTo);
+    console.log('[MAIL] account hit? ', !!account, account?.email);
 
-    // 5) 账号匹配（先找 exact 展示地址）
-    let account = await accountService.selectByEmailIncludeDel({ env }, targetDisplayAddr);
-    let finalTo = targetDisplayAddr;
-
-    // 5.1 若找不到，使用“每个展示域的汇聚账号（sink）”兜底
+    // 5.1 汇聚账号（sink）兜底：为每个展示域配置一个已有账号，确保 UI 可见
     if (!account) {
       const sinkMap = safeJSON(env.DISPLAY_SINK_ACCOUNT_MAP, {}); // { "ccc.sandbox.lib.uci.edu": "root@ccc.sandbox.lib.uci.edu", ... }
       const sinkEmail = normalizeEmail(sinkMap[displayDomain] || env.admin || '');
@@ -131,22 +149,18 @@ export async function email(message, env, ctx) {
         const maybe = await accountService.selectByEmailIncludeDel({ env }, sinkEmail);
         if (maybe) {
           account = maybe;
-          finalTo = sinkEmail; // 入库归档到汇聚账号，保证 UI 可见
+          finalTo = sinkEmail;
           console.log('[MAIL] sink fallback ->', sinkEmail);
         } else {
           console.log('[MAIL] sink email not found in accounts:', sinkEmail);
         }
-      } else {
-        console.log('[MAIL] no sink configured; keep targetDisplay even without account');
       }
     }
 
-    // 6) 是否强制可见
-    const FORCE_SAVE = String(env.FORCE_SAVE || 'true').toLowerCase() === 'true';
+    // 6) 无账号时的策略
     const acceptUnknown = String(env.ACCEPT_UNKNOWN_RECIPIENTS || 'true').toLowerCase() === 'true';
-
-    if (!account && !acceptUnknown && settings.noRecipient === settingConst.noRecipient.CLOSE) {
-      console.log('[MAIL] no account & noRecipient=CLOSE & acceptUnknown=false -> drop');
+    if (!account && !acceptUnknown && noRecipient === settingConst.noRecipient.CLOSE) {
+      console.log('[MAIL] no account & noRecipient=CLOSE -> drop');
       return;
     }
 
@@ -187,8 +201,8 @@ export async function email(message, env, ctx) {
       }
     }
 
-    // 8) 规则模式：FORCE_SAVE 时跳过规则拦截（保证可见）
-    if (!FORCE_SAVE && ruleType === settingConst.ruleType.RULE) {
+    // 8) 规则模式（如开启）
+    if (ruleType === settingConst.ruleType.RULE) {
       const emails = (ruleEmail || '').split(',').map(e => (e || '').trim().toLowerCase());
       if (!emails.includes(finalTo) && !emails.includes(envelopeTo)) {
         console.log('[MAIL] ruleType=RULE but not listed -> drop');
@@ -196,7 +210,7 @@ export async function email(message, env, ctx) {
       }
     }
 
-    // 9) 入库（只“收”，不再外转）
+    // 9) 入库（只“收”，不“转”）
     const toName =
       (parsed.to?.find?.(i => {
         const a = (i.address || '').toLowerCase();
@@ -246,10 +260,8 @@ export async function email(message, env, ctx) {
     });
     if (attachments.length > 0 && env.r2) await attService.addAtt({ env }, attachments);
 
-    // 设为 RECEIVE 以确保前端可见（FORCE_SAVE 时即便无账号也标记为 RECEIVE）
-    const finalStatus =
-      FORCE_SAVE ? emailConst.status.RECEIVE :
-      (account ? emailConst.status.RECEIVE : emailConst.status.NOONE);
+    // 状态：命中账号 -> RECEIVE；否则 NOONE（若你希望强制可见，可改为 RECEIVE）
+    const finalStatus = account ? emailConst.status.RECEIVE : emailConst.status.NOONE;
 
     emailRow = await emailService.completeReceive(
       { env },
@@ -259,9 +271,10 @@ export async function email(message, env, ctx) {
 
     console.log('[MAIL] saved OK -> emailId', emailRow.emailId, 'status=', finalStatus, 'finalTo=', finalTo);
 
-    // 不做 forward()，避免回环
-    // Telegram 推送如需保留，可在 settings.tgBotStatus=OPEN 时继续发送
-    if (settings.tgBotStatus === settingConst.tgBotStatus.OPEN && settings.tgChatId) {
+    // 不做任何 forward()，避免回环
+
+    // Telegram 推送（如开启）
+    if (tgBotStatus === settingConst.tgBotStatus.OPEN && tgChatId) {
       const msg = `<b>${params.subject || ''}</b>
 
 <b>发件人：</b>${params.name}\t&lt;${params.sendEmail}&gt;
@@ -271,8 +284,8 @@ export async function email(message, env, ctx) {
 ${params.text || emailUtils.htmlToText(params.content) || ''}`;
       try {
         await Promise.all(
-          settings.tgChatId.split(',').map(async id => {
-            const res = await fetch(`https://api.telegram.org/bot${settings.tgBotToken}/sendMessage`, {
+          tgChatId.split(',').map(async id => {
+            const res = await fetch(`https://api.telegram.org/bot${tgBotToken}/sendMessage`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ chat_id: id, parse_mode: 'HTML', text: msg })
