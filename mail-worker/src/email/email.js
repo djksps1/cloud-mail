@@ -41,7 +41,7 @@ function parseAddr(addr) {
   return { local: n.slice(0, i), domain: n.slice(i + 1) };
 }
 
-// 兼容 Cloudflare UI “JSON 类型变量”（可能已经是对象）
+// 兼容 Cloudflare UI 的 JSON 变量（可能直接传对象）
 function safeJSON(val, def) {
   try {
     if (!val) return def;
@@ -53,7 +53,7 @@ function safeJSON(val, def) {
   }
 }
 
-/** 还原 To：优先 To / X-Original-To / Original-Recipient；不使用 Delivered-To */
+/** 优先 To / X-Original-To / Original-Recipient；不使用 Delivered-To */
 function resolveRecipientFromHeaders(headers, fallback) {
   const tryKeys = ['to', 'x-original-to', 'original-recipient', 'envelope-to', 'x-receiver', 'x-forwarded-to'];
   for (const k of tryKeys) {
@@ -77,6 +77,20 @@ function mapToDisplayDomain(envelopeDomain, env) {
   return d;
 }
 
+/** 判定是否为“Gmail 转发副本”（来自指定 Gmail，且主题有 Fwd/FW/转发 等） */
+function isForwardedClone(parsed, headers, env) {
+  const blockFrom = (safeJSON(env.BLOCK_FWD_FROM, []) || []).map(s => String(s || '').toLowerCase());
+  const fromAddr = (parsed.from?.address || '').toLowerCase();
+  if (!blockFrom.includes(fromAddr)) return false;
+
+  const subjRaw = (parsed.subject || headers.get('subject') || '').trim();
+  const hasFwdPrefix = /^(\s*(fwd?|fw|转发|转寄)\s*[:：]\s*)/i.test(subjRaw);
+  const markerInBody =
+    /Forwarded message/i.test(parsed.text || '') ||
+    /Forwarded message/i.test(emailUtils.htmlToText(parsed.html || '') || '');
+  return hasFwdPrefix || markerInBody;
+}
+
 /* ----------------------------- main ----------------------------- */
 
 export async function email(message, env, ctx) {
@@ -94,11 +108,11 @@ export async function email(message, env, ctx) {
       return;
     }
 
-    // 0) envelope & headers（Email Workers 运行时提供）
-    const envelopeTo = normalizeEmail(message.to); // rcptTo（收件域判断用）
+    // 0) envelope & headers
+    const envelopeTo = normalizeEmail(message.to); // rcptTo（Email Workers 运行时提供）
     const headers = message.headers;
 
-    // 1) 白名单：只处理允许的接收域
+    // 1) 只处理允许的接收域
     const allow = safeJSON(env.ALLOWED_ENVELOPE_DOMAINS, []);
     const { local: envLocal, domain: envDomain } = parseAddr(envelopeTo);
     if (Array.isArray(allow) && allow.length > 0) {
@@ -109,13 +123,13 @@ export async function email(message, env, ctx) {
       }
     }
 
-    // 2) 解析 To（优先 To / X-Original-To 等），本地部分优先来自 headerTo
+    // 2) 解析 To（优先 To / X-Original-To 等）
     const headerToRaw = headers.get('to');
     const resolvedTo = resolveRecipientFromHeaders(headers, headerToRaw || envelopeTo);
     const { local: hdrLocal } = parseAddr(resolvedTo);
     const localPart = hdrLocal || envLocal;
 
-    // 3) 接收域 -> 展示域（仅用于入库显示，不做实际转发）
+    // 3) 接收域 -> 展示域（只用于入库显示）
     const displayDomain = mapToDisplayDomain(envDomain, env);
     let finalTo = normalizeEmail(`${localPart}@${displayDomain}`);
 
@@ -126,8 +140,7 @@ export async function email(message, env, ctx) {
     console.log('[MAIL] displayDomain =', displayDomain);
     console.log('[MAIL] finalTo       =', finalTo);
 
-    // 4) 读取原始报文并解析（PostalMime）
-    // message.raw 是 ReadableStream，可在 Email Workers 里读取再解析。:contentReference[oaicite:1]{index=1}
+    // 4) 读取与解析原始报文
     const reader = message.raw.getReader();
     let raw = '';
     while (true) {
@@ -135,15 +148,21 @@ export async function email(message, env, ctx) {
       if (done) break;
       raw += new TextDecoder().decode(value);
     }
-    const parsed = await PostalMime.parse(raw); // postal-mime 在 Workers/浏览器环境都可用。:contentReference[oaicite:2]{index=2}
+    const parsed = await PostalMime.parse(raw);
+
+    // 4.1 如果是 Gmail 转发副本，则丢弃（防重复）
+    if (isForwardedClone(parsed, headers, env)) {
+      console.log('[MAIL] drop Gmail forwarded clone from', parsed.from?.address, 'subject=', parsed.subject);
+      return; // 直接丢弃，不入库
+    }
 
     // 5) 账号匹配（以展示域地址为准）
     let account = await accountService.selectByEmailIncludeDel({ env }, finalTo);
     console.log('[MAIL] account hit? ', !!account, account?.email);
 
-    // 5.1 汇聚账号（sink）兜底：为每个展示域配置一个已有账号，确保 UI 可见
+    // 5.1 汇聚账号（sink）兜底（可选）
     if (!account) {
-      const sinkMap = safeJSON(env.DISPLAY_SINK_ACCOUNT_MAP, {}); // { "ccc.sandbox.lib.uci.edu": "root@ccc.sandbox.lib.uci.edu", ... }
+      const sinkMap = safeJSON(env.DISPLAY_SINK_ACCOUNT_MAP, {});
       const sinkEmail = normalizeEmail(sinkMap[displayDomain] || env.admin || '');
       if (sinkEmail) {
         const maybe = await accountService.selectByEmailIncludeDel({ env }, sinkEmail);
@@ -157,14 +176,14 @@ export async function email(message, env, ctx) {
       }
     }
 
-    // 6) 无账号时的策略
+    // 6) 无账号如何处理
     const acceptUnknown = String(env.ACCEPT_UNKNOWN_RECIPIENTS || 'true').toLowerCase() === 'true';
     if (!account && !acceptUnknown && noRecipient === settingConst.noRecipient.CLOSE) {
       console.log('[MAIL] no account & noRecipient=CLOSE -> drop');
       return;
     }
 
-    // 7) 权限/黑名单（仅在命中账号时检查）
+    // 7) 权限/黑名单（仅命中账号时检查）
     if (account && account.email !== env.admin) {
       let { banEmail, banEmailType, availDomain } =
         await roleService.selectByUserId({ env }, account.userId);
@@ -201,7 +220,7 @@ export async function email(message, env, ctx) {
       }
     }
 
-    // 8) 规则模式（如开启）
+    // 8) 规则过滤（如开启）
     if (ruleType === settingConst.ruleType.RULE) {
       const emails = (ruleEmail || '').split(',').map(e => (e || '').trim().toLowerCase());
       if (!emails.includes(finalTo) && !emails.includes(envelopeTo)) {
@@ -260,7 +279,6 @@ export async function email(message, env, ctx) {
     });
     if (attachments.length > 0 && env.r2) await attService.addAtt({ env }, attachments);
 
-    // 状态：命中账号 -> RECEIVE；否则 NOONE（若你希望强制可见，可改为 RECEIVE）
     const finalStatus = account ? emailConst.status.RECEIVE : emailConst.status.NOONE;
 
     emailRow = await emailService.completeReceive(
@@ -271,9 +289,9 @@ export async function email(message, env, ctx) {
 
     console.log('[MAIL] saved OK -> emailId', emailRow.emailId, 'status=', finalStatus, 'finalTo=', finalTo);
 
-    // 不做任何 forward()，避免回环
+    // 不做 forward()，避免回环
 
-    // Telegram 推送（如开启）
+    // Telegram（如开启）
     if (tgBotStatus === settingConst.tgBotStatus.OPEN && tgChatId) {
       const msg = `<b>${params.subject || ''}</b>
 
